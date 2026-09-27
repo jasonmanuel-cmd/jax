@@ -1,9 +1,8 @@
-"""Retrieval engine: keyword-based search across memories, events,
-decisions, and tasks.  No embeddings yet — deferred until pgvector.
+"""Scoped keyword retrieval across memories, decisions, and tasks.
+Unowned device events are excluded. No embeddings yet — deferred until pgvector.
 """
-from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, or_, text
-from .db import events
+from datetime import datetime, timezone
+from sqlalchemy import select, or_
 from .tables2 import memories, decisions, tasks
 
 
@@ -28,16 +27,24 @@ def retrieve_context(
     hours: int = 24,
     token_budget: int = 6000,
 ) -> dict:
-    """Return ranked context from memories, recent events, active
-    decisions, and open tasks.  All results are dicts, not ORM objects.
+    """Return ranked context for exactly one user and project scope.
+
+    No project means personal (NULL-project) records, not all projects.
+    Expired memories are excluded. Events lack scoped ownership and are omitted;
+    ``hours`` remains accepted for caller compatibility until events can be scoped.
+    ``token_budget`` is the legacy character budget, not a tokenizer-based limit.
+    All results are dicts, not ORM objects.
     """
     tokens = _tokenize(query)
     candidates: list[dict] = []
 
     # --- Memories --------------------------------------------------------
-    stmt = select(memories).where(memories.c.user_id == user_id)
-    if project_id:
-        stmt = stmt.where(memories.c.project_id == project_id)
+    stmt = select(memories).where(
+        memories.c.user_id == user_id,
+        or_(memories.c.expires_at.is_(None),
+            memories.c.expires_at > datetime.now(timezone.utc)),
+    )
+    stmt = stmt.where(memories.c.project_id == project_id)
     rows = db_conn.execute(stmt).mappings().all()
     for row in rows:
         s = _score(row['content'], tokens)
@@ -46,29 +53,13 @@ def retrieve_context(
                            'confidence': row['confidence'],
                            'score': s, 'created_at': row['created_at']})
 
-    # --- Recent events ---------------------------------------------------
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    estmt = select(events).where(events.c.device_id.in_(
-        select(events.c.device_id).where(events.c.occurred_at >= cutoff)
-    ))
-    if project_id:
-        estmt = estmt.where(
-            events.c.payload['type'].as_string().in_(['git_context'])
-        )
-    erows = db_conn.execute(estmt).mappings().all()
-    for row in erows:
-        payload = row['payload']
-        s = _score(payload.get('summary', ''), tokens)
-        candidates.append({
-            'kind': 'event', 'id': row['id'],
-            'snippet': payload.get('summary', '')[:300],
-            'score': s, 'occurred_at': row['occurred_at'],
-        })
+    # Events currently have neither a trusted user nor project binding (nor do
+    # devices). Fail closed: git_context type, payload claims, and device recency
+    # cannot establish authorization. Re-enable only with verified scoped ownership.
 
     # --- Active decisions ------------------------------------------------
     dstmt = select(decisions).where(decisions.c.user_id == user_id)
-    if project_id:
-        dstmt = dstmt.where(decisions.c.project_id == project_id)
+    dstmt = dstmt.where(decisions.c.project_id == project_id)
     drows = db_conn.execute(dstmt).mappings().all()
     for row in drows:
         s = _score(row['decision'], tokens)
@@ -84,8 +75,7 @@ def retrieve_context(
         tasks.c.user_id == user_id,
         tasks.c.status == 'open',
     )
-    if project_id:
-        tstmt = tstmt.where(tasks.c.project_id == project_id)
+    tstmt = tstmt.where(tasks.c.project_id == project_id)
     trows = db_conn.execute(tstmt).mappings().all()
     for row in trows:
         s = _score(row['title'], tokens)

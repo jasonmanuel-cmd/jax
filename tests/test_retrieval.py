@@ -28,6 +28,70 @@ def register(client):
 
 # ---- Retrieval ----
 
+@pytest.fixture
+def retrieval_db():
+    from core.app.db import make_engine
+    engine = make_engine('sqlite:///:memory:')
+    with engine.begin() as conn:
+        yield conn
+    engine.dispose()
+
+
+@pytest.mark.parametrize('project_id, expected', [(None, {'personal'}), ('p1', {'p1-item'})])
+@pytest.mark.parametrize('table_name, text_field', [
+    ('memories', 'content'), ('tasks', 'title'), ('decisions', 'decision')])
+def test_retrieval_never_implicitly_merges_project_scopes(retrieval_db, project_id, expected,
+                                                        table_name, text_field):
+    from core.app import tables2
+    from core.app.retrieval import retrieve_context
+    now = datetime.now(timezone.utc)
+    for pid in ('p1', 'p2'):
+        retrieval_db.execute(tables2.projects.insert().values(
+            id=pid, user_id='u1', name=pid, created_at=now))
+    table = getattr(tables2, table_name)
+    for identifier, scope, user in [('personal', None, 'u1'), ('p1-item', 'p1', 'u1'),
+                                    ('p2-item', 'p2', 'u1'), ('other-user', None, 'u2')]:
+        values = dict(id=identifier, user_id=user, project_id=scope)
+        values[text_field] = 'shared keyword'
+        values['decided_at' if table_name == 'decisions' else 'created_at'] = now
+        if table_name == 'memories':
+            values['kind'] = 'fact'
+        retrieval_db.execute(table.insert().values(**values))
+    ctx = retrieve_context('shared keyword', project_id=project_id, user_id='u1',
+                           db_conn=retrieval_db)
+    assert {s['id'] for s in ctx['sources']} == expected
+
+
+def test_expired_memories_are_not_retrieved(retrieval_db):
+    from datetime import timedelta
+    from core.app.tables2 import memories
+    from core.app.retrieval import retrieve_context
+    now = datetime.now(timezone.utc)
+    for identifier, expires in [('expired', now - timedelta(seconds=1)),
+                                ('future', now + timedelta(days=1)), ('durable', None)]:
+        retrieval_db.execute(memories.insert().values(
+            id=identifier, user_id='u1', kind='fact', content='keyword',
+            created_at=now, expires_at=expires))
+    ctx = retrieve_context('keyword', user_id='u1', db_conn=retrieval_db)
+    assert {s['id'] for s in ctx['sources']} == {'future', 'durable'}
+
+
+@pytest.mark.parametrize('project_id', [None, 'p1'])
+def test_unscoped_device_events_cannot_leak_into_context(retrieval_db, project_id):
+    from core.app.db import devices, events
+    from core.app.retrieval import retrieve_context
+    retrieval_db.execute(devices.insert().values(
+        id='device', name='Laptop', platform='windows', token_hash='test-digest'))
+    retrieval_db.execute(events.insert().values(
+        id='foreign-project-event', device_id='device', occurred_at=datetime.now(timezone.utc),
+        payload={'type': 'git_context', 'summary': 'private project keyword'}))
+    # Neither events nor devices has a trusted owner/project relation. A git_context
+    # type and a recent timestamp are not proof this event belongs in this context.
+    ctx = retrieve_context('keyword', project_id=project_id, user_id='u1',
+                           db_conn=retrieval_db)
+    assert ctx['sources'] == []
+
+
 def test_retrieve_returns_structured_response(client):
     # Seed some data
     client.post('/v1/memories', headers=AUTH, json={

@@ -2,7 +2,11 @@
 
 Jason's private cross-device AI. Local-first, permissioned, auditable.
 
-**Blueprint:** `docs/blueprint.pdf` — Complete Build Blueprint (archived from original PDFs)
+**Canonical specification:** `docs/JAX_Master_Developer_Specification.pdf` — September 27, 2026 master specification supplied by Jason. This supersedes the archived `docs/blueprint.pdf` where they differ.
+
+JAX is the control plane around replaceable models and agents: Git owns source code, the JAX database owns operational state, Supermemory supplies durable semantic context, and Jason retains final authority. **Turn Your Chaos Into Code.**
+
+See `DECISIONS.md` for adoption boundaries and `docs/SPEC_AUDIT.md` for the specification gap assessment. Existing features and historical phase reports are not proof that canonical JAX V1 is complete.
 
 ## Quick start
 

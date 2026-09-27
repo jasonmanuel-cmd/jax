@@ -106,6 +106,11 @@ class MemoryIn(BaseModel):
     source_event_id: int | None = None
     expires_at: datetime | None = None
 
+    @field_validator('kind', 'content')
+    @classmethod
+    def reject_memory_secrets(cls, value):
+        return safe_text(value)
+
 
 class TaskIn(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -354,6 +359,44 @@ def create_app(database_url=None, admin_token=None):
                 raise HTTPException(404, 'Project not found')
         return {'id': str(project_id), 'deleted': True}
 
+    # Canonical preflight is deliberately narrower than project CRUD: only
+    # server-configured exact repository roots may reach local Git.
+    class PreflightIn(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        project_id: UUID
+        fetch: bool = True
+        fast_forward: bool = False
+
+    @app.post('/v1/sessions/preflight')
+    def session_preflight(body: PreflightIn, actor=Depends(admin)):
+        with engine.connect() as db:
+            if is_kill_active(db, None):
+                raise HTTPException(403, 'Kill switch active')
+            project = db.execute(select(projects).where(
+                projects.c.id == str(body.project_id))).mappings().first()
+        if project is None:
+            raise HTTPException(404, 'Project not found')
+        if project['status'] != 'active':
+            raise HTTPException(409, 'Project is not active')
+        if not project['path_hint']:
+            raise HTTPException(409, 'Project has no configured local path')
+        try:
+            root = Path(project['path_hint']).resolve(strict=True)
+            allowed = [Path(p).resolve(strict=True) for p in
+                       os.environ.get('JAX_PROJECT_ROOTS', '').split(os.pathsep) if p.strip()]
+        except (OSError, RuntimeError):
+            raise HTTPException(403, 'Project path is unavailable or not allowed')
+        if root not in allowed:
+            raise HTTPException(403, 'Project root is not allowlisted')
+        if body.fast_forward and not body.fetch:
+            raise HTTPException(422, 'Fast-forward requires remote verification')
+        from .git_control import inspect_repository
+        try:
+            state = inspect_repository(root, fetch=body.fetch, fast_forward=body.fast_forward)
+        except (ValueError, OSError, RuntimeError):
+            raise HTTPException(409, 'Repository preflight failed')
+        return {'project_id': str(body.project_id), **state}
+
     # -----------------------------------------------------------------------
     # Memories  (explicit save/delete only)
     # -----------------------------------------------------------------------
@@ -504,10 +547,8 @@ def create_app(database_url=None, admin_token=None):
                 user_id=actor['id'],
                 db_conn=db,
             )
-        messages = [
-            {'role': 'system', 'content': 'chat_v1'},
-            {'role': 'user', 'content': body.query},
-        ]
+        from .context_messages import build_messages
+        messages = build_messages(body.query, ctx)
         result = await app.state.provider.complete(messages)
         return {
             'answer': result['answer'],
@@ -575,10 +616,8 @@ def create_app(database_url=None, admin_token=None):
                 user_id=actor['id'],
                 db_conn=db,
             )
-        messages = [
-            {'role': 'system', 'content': 'chat_v1'},
-            {'role': 'user', 'content': transcript},
-        ]
+        from .context_messages import build_messages
+        messages = build_messages(transcript, ctx)
         result = await app.state.provider.complete(messages)
 
         try:
