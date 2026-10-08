@@ -146,6 +146,111 @@ def test_head_change_during_fetch_cannot_launch(repos, monkeypatch):
     assert result['error']
 
 
+def test_transport_failure_is_retried_once(repos, monkeypatch):
+    """One transient fetch failure must not be mistaken for a dead remote."""
+    local, _, _ = repos
+    module = importlib.import_module('core.app.git_control')
+    original = module._git
+    calls = []
+
+    def fail_once(path, *args):
+        if args and args[0] == 'fetch':
+            calls.append(args[0])
+            if len(calls) == 1:
+                raise OSError('connection reset')
+        return original(path, *args)
+
+    monkeypatch.setattr(module, '_git', fail_once)
+    result = inspect(local)
+    assert len(calls) == 2, 'expected exactly one retry'
+    assert result['remote_verified'] is True
+    assert result['state'] == 'READY'
+    assert result['launch_allowed'] is True
+
+
+def test_repeated_transport_failure_still_fails_closed(repos, monkeypatch):
+    """A retry must never promote an unverifiable repo to verified."""
+    local, _, _ = repos
+    module = importlib.import_module('core.app.git_control')
+    original = module._git
+
+    def always_fail(path, *args):
+        if args and args[0] == 'fetch':
+            raise OSError('connection reset')
+        return original(path, *args)
+
+    monkeypatch.setattr(module, '_git', always_fail)
+    result = inspect(local, fetch=True, fast_forward=False)
+    assert result['remote_verified'] is False
+    assert result['state'] == 'REMOTE_UNREACHABLE'
+    assert result['launch_allowed'] is False
+    assert result['error']
+
+
+def test_sha_mismatch_is_not_retried(repos, monkeypatch):
+    """A deterministic mismatch must not be retried as if it were flaky."""
+    local, _, _ = repos
+    module = importlib.import_module('core.app.git_control')
+    original = module._git
+    fetches = []
+
+    def mismatch(path, *args):
+        if args and args[0] == 'rev-parse' and args[1] == 'FETCH_HEAD':
+            return 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n'
+        if args and args[0] == 'fetch':
+            fetches.append(1)
+        return original(path, *args)
+
+    monkeypatch.setattr(module, '_git', mismatch)
+    result = inspect(local)
+    assert len(fetches) == 1, 'SHA mismatch must not trigger a retry'
+    assert result['remote_verified'] is False
+    assert result['state'] == 'REMOTE_UNREACHABLE'
+    assert result['launch_allowed'] is False
+    # The operator must be able to tell which SHAs disagreed.
+    assert 'does not match upstream' in result['error']
+    assert 'deadbeef' in result['error']
+
+
+def test_fetch_error_reports_git_diagnosis(repos, monkeypatch):
+    """Auth/DNS/404 causes must be visible, not collapsed into one string."""
+    local, _, _ = repos
+    module = importlib.import_module('core.app.git_control')
+    original = module._git
+
+    def auth_error(path, *args):
+        if args and args[0] == 'fetch':
+            raise subprocess.CalledProcessError(
+                128, 'git fetch', 'out', 'fatal: could not read Username')
+        return original(path, *args)
+
+    monkeypatch.setattr(module, '_git', auth_error)
+    result = inspect(local, fetch=True, fast_forward=False)
+    assert result['remote_verified'] is False
+    assert result['launch_allowed'] is False
+    assert 'could not read Username' in result['error']
+    assert 'Remote fetch failed' in result['error']
+
+
+def test_timeout_reports_the_budget(repos, monkeypatch):
+    """A timeout must state the budget so the operator can judge it."""
+    local, _, _ = repos
+    module = importlib.import_module('core.app.git_control')
+    original = module._git
+
+    def timeout(path, *args):
+        if args and args[0] == 'fetch':
+            raise subprocess.TimeoutExpired('git fetch', module.COMMAND_TIMEOUT)
+        return original(path, *args)
+
+    monkeypatch.setattr(module, '_git', timeout)
+    result = inspect(local, fetch=True, fast_forward=False)
+    assert result['remote_verified'] is False
+    assert result['launch_allowed'] is False
+    assert 'timed out' in result['error']
+    assert str(module.COMMAND_TIMEOUT) in result['error']
+
+
 def test_verified_ready_is_json_safe(repos):
     local, _, _ = repos
     result = inspect(local)

@@ -55,16 +55,46 @@ def inspect_repository(path, fetch=True, fast_forward=False):
     remote_verified = False
     error = 'Remote verification skipped'
     if fetch:
-        try:
-            remote_ref = _git(path, 'config', '--get', f'branch.{branch}.merge')
-            _git(path, 'fetch', '--no-tags', '--no-recurse-submodules', '--',
-                 remote, remote_ref)
-            if _git(path, 'rev-parse', 'FETCH_HEAD') != _git(path, 'rev-parse', '@{upstream}'):
-                raise ValueError('Fetched remote does not match upstream tracking ref')
-            remote_verified = True
-            error = None
-        except (subprocess.SubprocessError, OSError, ValueError):
-            error = 'Remote fetch failed or timed out'
+        remote_ref = _git(path, 'config', '--get', f'branch.{branch}.merge')
+
+        def fetch_once():
+            """Return (transport_error, mismatch). Only transport_error is retryable.
+
+            A SHA mismatch is deterministic, so retrying it would just repeat the
+            same verdict; a transport failure may be a transient network blip.
+            """
+            try:
+                _git(path, 'fetch', '--no-tags', '--no-recurse-submodules', '--',
+                     remote, remote_ref)
+            except subprocess.TimeoutExpired:
+                return f'Remote fetch timed out after {COMMAND_TIMEOUT}s', None
+            except subprocess.CalledProcessError as exc:
+                # Surface git's own diagnosis (auth, DNS, TLS, 404); far more
+                # actionable than a single generic failure string.
+                detail = (exc.stderr or exc.stdout or '').strip().splitlines()
+                reason = detail[-1].strip() if detail else f'git exited {exc.returncode}'
+                return f'Remote fetch failed: {reason[:200]}', None
+            except (subprocess.SubprocessError, OSError) as exc:
+                return f'Remote fetch error: {type(exc).__name__}', None
+            try:
+                fetched = _git(path, 'rev-parse', 'FETCH_HEAD')
+                tracked = _git(path, 'rev-parse', '@{upstream}')
+            except (subprocess.SubprocessError, OSError):
+                return 'Could not resolve FETCH_HEAD after a successful fetch', None
+            if fetched == tracked:
+                return None, None
+            return (None,
+                    'Fetched remote does not match upstream tracking ref '
+                    f'({fetched[:12]} != {tracked[:12]})')
+
+        # One retry for transport-level failures only. A retry can never promote
+        # a repo to verified: verification still requires a matching SHA.
+        for _ in range(2):
+            transport_error, mismatch = fetch_once()
+            if transport_error is None:
+                break
+        error = transport_error or mismatch
+        remote_verified = error is None
     upstream_head = _git(path, 'rev-parse', '@{upstream}')
     ahead, behind = map(int, _git(path, 'rev-list', '--left-right', '--count',
                                   f'{head}...{upstream_head}').split())
