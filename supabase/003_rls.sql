@@ -19,6 +19,14 @@ ALTER TABLE agent_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kill_switch ENABLE ROW LEVEL SECURITY;
 ALTER TABLE improvement_proposals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE voice_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
+
+-- Audit events are read-only for authenticated users and have no INSERT,
+-- UPDATE or DELETE policy: the log is append-only through the service role
+-- only, so a compromised client token cannot rewrite history.
+CREATE POLICY audit_events_read ON audit_events
+    FOR SELECT TO authenticated
+    USING (true);
 
 -- ---------------------------------------------------------------------------
 -- User-owned tables: users can only see/modify their own rows

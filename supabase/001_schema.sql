@@ -175,6 +175,24 @@ CREATE TABLE IF NOT EXISTS tool_runs (
 );
 
 -- ---------------------------------------------------------------------------
+-- Audit events (append-only: no UPDATE or DELETE grant is intended)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    actor VARCHAR(120) NOT NULL,
+    action VARCHAR(120) NOT NULL,
+    target VARCHAR(512),
+    result VARCHAR(60),
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_created
+    ON audit_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_action
+    ON audit_events (action);
+
+-- ---------------------------------------------------------------------------
 -- Agent runs
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_runs (

@@ -160,6 +160,17 @@ kill_switch = Table(
     Column('activated_by', String(36), nullable=False),
 )
 
+audit_events = Table(
+    'audit_events', metadata,
+    _uuid_pk('id'),
+    Column('actor', String(120), nullable=False),
+    Column('action', String(120), nullable=False),
+    Column('target', String(512), nullable=True),
+    Column('result', String(60), nullable=True),
+    Column('metadata', JSON, nullable=True),
+    Column('created_at', DateTime(timezone=True), nullable=False),
+)
+
 leads = Table(
     'leads', metadata,
     _uuid_pk('id'),

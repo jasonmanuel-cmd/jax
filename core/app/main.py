@@ -3,6 +3,7 @@ import hashlib
 import os
 import secrets
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -25,7 +26,8 @@ from .providers.openai_provider import OpenAIProvider
 from .providers.groq import GroqProvider
 from .voice import VoiceProvider
 from .agents import build_registry
-from .policy_engine import default_registry
+from .audit.approvals import ApprovalStore, AuditLog
+from .policy_engine import PolicyDenied, default_registry
 from .core.session_manager import LaunchRefused, SessionManager
 from sqlalchemy import select
 from .db import devices, events, improvement_proposals, make_engine
@@ -185,6 +187,8 @@ def create_app(database_url=None, admin_token=None):
     # Managed-session control plane: adapters, policy, session lifecycle.
     adapters = build_registry()
     policy = default_registry()
+    audit = AuditLog(engine)
+    approvals = ApprovalStore(engine, policy)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -198,6 +202,8 @@ def create_app(database_url=None, admin_token=None):
     app.state.adapters = adapters
     app.state.policy = policy
     app.state.sessions = SessionManager(engine, adapters, policy)
+    app.state.audit = audit
+    app.state.approvals = approvals
 
     # Serve the web UI
     _ui_path = Path(__file__).resolve().parent.parent / 'static' / 'index.html'
@@ -566,6 +572,65 @@ def create_app(database_url=None, admin_token=None):
             'model_used': result['model_used'],
             'prompt_version': PROMPT_VERSION,
         }
+
+    # -----------------------------------------------------------------------
+    # Approvals and audit
+    # -----------------------------------------------------------------------
+
+    class ApprovalRequestIn(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        tool: str = Field(min_length=1, max_length=80)
+        arguments: dict = Field(default_factory=dict)
+        device_id: str | None = None
+        reason: str | None = Field(default=None, max_length=500)
+        ttl_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+    @app.get('/v1/approvals')
+    def list_approvals(state: Optional[str] = None, actor=Depends(admin)):
+        """List approval requests. Listing never grants anything."""
+        return {'approvals': app.state.approvals.list(state)}
+
+    @app.post('/v1/approvals', status_code=201)
+    def request_approval(body: ApprovalRequestIn, actor=Depends(admin)):
+        """Request approval for one L4 action. Grants nothing by itself."""
+        try:
+            result = app.state.approvals.request(
+                actor['id'], body.tool, body.arguments, body.device_id,
+                ttl=timedelta(minutes=body.ttl_minutes) if body.ttl_minutes else None,
+                reason=body.reason)
+        except PolicyDenied as exc:
+            app.state.audit.record(actor['id'], 'approval.request',
+                                   body.tool, exc.code)
+            raise HTTPException(400, exc.detail)
+        app.state.audit.record(actor['id'], 'approval.request', body.tool,
+                               'pending', {'approval_id': result['id']})
+        return result
+
+    class ApprovalDecisionIn(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        approve: bool
+
+    @app.post('/v1/approvals/{approval_id}/decide')
+    def decide_approval(approval_id: str, body: ApprovalDecisionIn,
+                        actor=Depends(admin)):
+        """Approve or deny. The decision is recorded either way."""
+        try:
+            result = app.state.approvals.decide(approval_id, body.approve,
+                                                actor['id'])
+        except KeyError:
+            raise HTTPException(404, 'Approval not found')
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        app.state.audit.record(
+            actor['id'], 'approval.decide' if body.approve else 'approval.deny',
+            result['tool'], result['state'], {'approval_id': approval_id})
+        return result
+
+    @app.get('/v1/audit')
+    def list_audit(limit: int = Query(default=100, ge=1, le=500),
+                   action: Optional[str] = None, actor=Depends(admin)):
+        """Append-only audit trail."""
+        return {'events': app.state.audit.list(limit=limit, action=action)}
 
     # -----------------------------------------------------------------------
     # Managed sessions and agent adapters
