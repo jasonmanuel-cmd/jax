@@ -8,9 +8,12 @@ if not exist ".env" (
   exit /b 1
 )
 
-REM Load KEY=VALUE lines from .env into the environment
-for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do (
-  if not "%%A"=="" set "%%A=%%B"
+if not exist ".venv\Scripts\python.exe" (
+  echo ERROR: .venv not found. Create it first:  python -m venv .venv
+  echo        then:  .venv\Scripts\python.exe -m pip install -r requirements.txt
+  exit /b 1
 )
 
-.venv\Scripts\python.exe -m uvicorn core.app.main:create_app --factory --host 127.0.0.1 --port 8788
+REM start_server.py loads .env with python-dotenv, the same loader the app
+REM uses. Parsing .env in batch would silently mishandle quotes and spaces.
+.venv\Scripts\python.exe start_server.py

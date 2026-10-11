@@ -1,21 +1,17 @@
-"""Start JAX server with environment loaded from .env."""
-import os
-import sys
+"""Start JAX server with environment loaded from .env.
+
+Uses the same loader as the app (core.app.main calls load_dotenv), so values
+are parsed consistently whether you start via this script or via uvicorn.
+"""
 from pathlib import Path
 
-# Load .env
-env_path = Path(__file__).resolve().parent / ".env"
-if env_path.exists():
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip())
+from dotenv import load_dotenv
 
-# Start server
-from core.app.main import create_app
-import uvicorn
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
-app = create_app()
-uvicorn.run(app, host="127.0.0.1", port=8788, log_level="info")
+import uvicorn  # noqa: E402
+
+from core.app.main import create_app  # noqa: E402
+
+if __name__ == "__main__":
+    uvicorn.run(create_app(), host="127.0.0.1", port=8788, log_level="info")
