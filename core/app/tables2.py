@@ -140,9 +140,14 @@ agent_runs = Table(
     Column('objective', Text, nullable=False),
     Column('status', String(20), nullable=False, default='running'),
     Column('model', String(80), nullable=True),
+    Column('project_id', String(36), ForeignKey('projects.id'), nullable=True),
+    Column('machine_id', String(120), nullable=True),
+    Column('device_id', String(36), ForeignKey('devices.id'), nullable=True),
+    Column('base_commit', String(64), nullable=True),
+    Column('final_commit', String(64), nullable=True),
+    Column('error', Text, nullable=True),
     Column('started_at', DateTime(timezone=True), nullable=False),
     Column('finished_at', DateTime(timezone=True), nullable=True),
-    Column('device_id', String(36), ForeignKey('devices.id'), nullable=True),
 )
 
 kill_switch = Table(

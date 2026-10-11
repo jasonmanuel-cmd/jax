@@ -24,6 +24,9 @@ from .providers.openrouter import OpenRouterProvider
 from .providers.openai_provider import OpenAIProvider
 from .providers.groq import GroqProvider
 from .voice import VoiceProvider
+from .agents import build_registry
+from .policy_engine import default_registry
+from .core.session_manager import LaunchRefused, SessionManager
 from sqlalchemy import select
 from .db import devices, events, improvement_proposals, make_engine
 from .tables2 import (
@@ -179,6 +182,10 @@ def create_app(database_url=None, admin_token=None):
 
     voice = VoiceProvider()
 
+    # Managed-session control plane: adapters, policy, session lifecycle.
+    adapters = build_registry()
+    policy = default_registry()
+
     @asynccontextmanager
     async def lifespan(app):
         yield
@@ -188,6 +195,9 @@ def create_app(database_url=None, admin_token=None):
     app.state.engine = engine
     app.state.provider = provider
     app.state.voice = voice
+    app.state.adapters = adapters
+    app.state.policy = policy
+    app.state.sessions = SessionManager(engine, adapters, policy)
 
     # Serve the web UI
     _ui_path = Path(__file__).resolve().parent.parent / 'static' / 'index.html'
@@ -556,6 +566,60 @@ def create_app(database_url=None, admin_token=None):
             'model_used': result['model_used'],
             'prompt_version': PROMPT_VERSION,
         }
+
+    # -----------------------------------------------------------------------
+    # Managed sessions and agent adapters
+    # -----------------------------------------------------------------------
+
+    @app.get('/v1/agents')
+    def list_agents(actor=Depends(admin)):
+        """Adapter health. Availability is probed, never assumed."""
+        return {'adapters': app.state.adapters.healthcheck()}
+
+    @app.get('/v1/tools')
+    def list_tools(actor=Depends(admin)):
+        """Registered tools with their autonomy level and gating."""
+        return {'tools': [
+            {'name': p.name, 'level': p.level, 'description': p.description,
+             'requires_approval': p.requires_approval, 'reversible': p.reversible}
+            for p in app.state.policy.registry.values()]}
+
+    class LaunchAgentRequest(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        agent: str = Field(min_length=1, max_length=80)
+        objective: str = Field(min_length=1, max_length=4000)
+        machine_id: str = Field(min_length=1, max_length=120)
+
+    @app.post('/v1/sessions/{session_id}/launch-agent')
+    def launch_agent(session_id: str, body: LaunchAgentRequest, actor=Depends(admin)):
+        """Launch an adapter after the policy and kill-switch checks."""
+        try:
+            return app.state.sessions.launch(
+                session_id, body.machine_id, body.agent, body.objective)
+        except LaunchRefused as exc:
+            raise HTTPException(exc.status, exc.detail)
+
+    class VerifySessionRequest(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+        root: str | None = None
+        fetch: bool = False
+        test_commands: list[str] = Field(default_factory=list, max_length=20)
+
+    @app.post('/v1/sessions/{session_id}/verify')
+    def verify_session(session_id: str, body: VerifySessionRequest,
+                       actor=Depends(admin)):
+        """Run configured verification, then write a truthful handoff."""
+        try:
+            return app.state.sessions.verify_and_close(
+                session_id, body.root, body.test_commands, fetch=body.fetch)
+        except LaunchRefused as exc:
+            raise HTTPException(exc.status, exc.detail)
+
+    @app.post('/v1/sessions/{session_id}/handoff')
+    def close_session(session_id: str, body: VerifySessionRequest,
+                      actor=Depends(admin)):
+        """Close the session. Same evidence contract as verify."""
+        return verify_session(session_id, body)
 
     # -----------------------------------------------------------------------
     # Voice endpoints

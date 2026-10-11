@@ -183,6 +183,13 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     objective TEXT NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'running',
     model VARCHAR(80),
+    -- Local machine identity (e.g. 'travel-laptop') lives in local config and is
+    -- NOT the devices.id UUID. device_id is set only when the machine is enrolled.
+    machine_id VARCHAR(120),
+    project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+    base_commit VARCHAR(64),
+    final_commit VARCHAR(64),
+    error TEXT,
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at TIMESTAMPTZ,
     device_id UUID REFERENCES devices(id) ON DELETE SET NULL
