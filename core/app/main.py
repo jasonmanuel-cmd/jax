@@ -25,6 +25,8 @@ from .providers.base import ModelProvider, LocalProvider
 from .providers.openrouter import OpenRouterProvider
 from .providers.openai_provider import OpenAIProvider
 from .providers.groq import GroqProvider
+from .providers.ollama_provider import OllamaProvider
+from .providers.base import ProviderError, ProviderUnavailable
 from .voice import VoiceProvider
 from .agents import build_registry
 from .audit.approvals import ApprovalStore, AuditLog
@@ -180,8 +182,21 @@ def create_app(database_url=None, admin_token=None):
         provider = GroqProvider(
             model=os.environ.get('JAX_MODEL', 'llama-3.3-70b-versatile')
         )
-    else:
+    elif provider_name == 'ollama':
+        # Local inference. No API key, nothing leaves the machine. The model
+        # default matches what is usually pulled; override with JAX_MODEL.
+        provider = OllamaProvider(
+            model=os.environ.get('JAX_MODEL', 'qwen3-coder:30b')
+        )
+    elif provider_name == 'stub':
         provider = LocalProvider()
+    else:
+        # Previously any unrecognised name silently produced LocalProvider,
+        # so a typo in JAX_PROVIDER looked like a working deployment that
+        # returned "Model provider not yet configured." Fail loudly instead.
+        raise RuntimeError(
+            f'Unknown JAX_PROVIDER {provider_name!r}. Expected one of: '
+            'ollama, openrouter, openai, groq, stub.')
 
     voice = VoiceProvider()
 
@@ -273,6 +288,20 @@ def create_app(database_url=None, admin_token=None):
     @app.get('/health')
     def health():
         return {'status': 'ok', 'service': 'jax-core'}
+
+    @app.get('/v1/provider/health')
+    async def provider_health(actor=Depends(admin)):
+        """Report model-provider reachability.
+
+        Deliberately a read and deliberately not kill-gated: 'why is chat
+        failing' is exactly the question you ask during an incident. The
+        provider reports itself rather than this endpoint guessing, and it
+        never raises, so a dead backend yields available=false rather than a
+        500 that hides the cause.
+        """
+        report = await app.state.provider.healthcheck()
+        return {'provider': type(app.state.provider).__name__,
+                'report': report}
 
     # -----------------------------------------------------------------------
     # Devices
@@ -595,7 +624,16 @@ def create_app(database_url=None, admin_token=None):
             )
         from .context_messages import build_messages
         messages = build_messages(body.query, ctx)
-        result = await app.state.provider.complete(messages)
+        # A provider failure must surface as a failure. Returning an error
+        # string in 'answer' would make an outage indistinguishable from a
+        # model reply (SPEC_AUDIT R9).
+        try:
+            result = await app.state.provider.complete(messages)
+        except ProviderUnavailable as exc:
+            raise HTTPException(503, f'Model provider unavailable: {exc}',
+                                headers={'Retry-After': '30'})
+        except ProviderError as exc:
+            raise HTTPException(502, f'Model provider error: {exc}')
         return {
             'answer': result['answer'],
             'sources': ctx['sources'],
