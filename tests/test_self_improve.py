@@ -350,8 +350,13 @@ def test_apply_proposal_requires_confirmation(client):
     assert resp.status_code == 400
 
 
-def test_apply_proposal_succeeds(client):
-    """Apply should update status to 'applied'."""
+def test_apply_proposal_materializes_patch_without_claiming_success(client):
+    """Apply must not report a code change it did not make (SPEC_AUDIT R8).
+
+    Previously this asserted 200 + status 'applied', which passed while the
+    endpoint wrote nothing at all. It now returns 202 and reports
+    applied=false with a reviewable patch reference.
+    """
     client.post('/v1/self-improve/analyze', headers=AUTH, json={})
     proposals = client.get('/v1/self-improve/proposals', headers=AUTH).json()["proposals"]
     pid = proposals[0]["id"]
@@ -360,19 +365,21 @@ def test_apply_proposal_succeeds(client):
         headers=AUTH,
         json={"confirm": True},
     )
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "applied"
-    assert "applied_at" in resp.json()
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["applied"] is False
+    assert body["requires_review"] is True
+    assert "applied_at" in body
 
 
 def test_apply_proposal_twice_fails(client):
-    """Applying an already-applied proposal should 404."""
+    """Re-applying a materialized proposal is a conflict, not a silent success."""
     client.post('/v1/self-improve/analyze', headers=AUTH, json={})
     proposals = client.get('/v1/self-improve/proposals', headers=AUTH).json()["proposals"]
     pid = proposals[0]["id"]
     client.post(f'/v1/self-improve/proposals/{pid}/apply', headers=AUTH, json={"confirm": True})
     resp = client.post(f'/v1/self-improve/proposals/{pid}/apply', headers=AUTH, json={"confirm": True})
-    assert resp.status_code == 404
+    assert resp.status_code == 409
 
 
 def test_reject_proposal(client):
@@ -411,13 +418,14 @@ def test_apply_proposal_nonexistent(client):
 
 
 def test_audit_trail_rejected_proposals_not_reapplicable(client):
-    """Rejected proposals should not be re-appliable."""
+    """Rejected proposals must not be appliable; the state conflict is explicit."""
     client.post('/v1/self-improve/analyze', headers=AUTH, json={})
     proposals = client.get('/v1/self-improve/proposals', headers=AUTH).json()["proposals"]
     pid = proposals[0]["id"]
     client.post(f'/v1/self-improve/proposals/{pid}/reject', headers=AUTH, json={"note": "no"})
     resp = client.post(f'/v1/self-improve/proposals/{pid}/apply', headers=AUTH, json={"confirm": True})
-    assert resp.status_code == 404
+    assert resp.status_code == 409
+    assert 'rejected' in resp.json()['detail']
 
 
 def test_no_auto_execution_property():

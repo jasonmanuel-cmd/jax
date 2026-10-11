@@ -212,17 +212,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Enter') searchLeads();
   });
 
-  // Restore saved token
-  const saved = (() => { try { return localStorage.getItem('jax_token') || ''; } catch { return ''; } })();
-  if (saved.length >= 32) {
-    TOKEN = saved;
-    fetch('/health').then(r => r.json()).then(d => {
-      if (d.status === 'ok') {
-        fetch('/v1/devices', { headers: { Authorization: 'Bearer ' + saved } })
-          .then(r => { if (r.status !== 401 && r.status !== 403) enterChat(); });
-      }
-    }).catch(() => {});
-  }
+  // No token restore. The token lives in memory for the session only:
+  // localStorage is readable by any script on this origin, so a single
+  // injection would otherwise exfiltrate the admin credential. Re-enter
+  // it after a reload; the core binds to loopback only.
   checkHealth();
 });
 
@@ -245,7 +238,7 @@ async function doAuth() {
     const r = await fetch('/v1/devices', { headers: { Authorization: 'Bearer ' + t } });
     if (r.status === 401 || r.status === 403) { setAerr('Invalid token'); return; }
     TOKEN = t;
-    try { localStorage.setItem('jax_token', t); } catch {}
+    // Token stays in the TOKEN variable only; never persisted.
     enterChat();
   } catch { setAerr('Cannot reach JAX — is the server running?'); }
   finally { btn.disabled = false; btn.textContent = 'CONNECT →'; }
@@ -487,11 +480,15 @@ function renderLeads(data, loc, type) {
     html += `<div class="sl-header">WEB RESULTS (${data.results.length}) — ${escHtml(loc.toUpperCase())} · ${escHtml(type.replace(/_/g,' ').toUpperCase())}</div>`;
     html += '<div class="result-list">';
     for (const r of data.results) {
-      html += `<div class="result-card" onclick="window.open('${escAttr(r.url)}','_blank')">
-        <div class="rc-title">${escHtml(r.title)}</div>
-        <div class="rc-url">${escHtml(r.url)}</div>
+      // Untrusted scraped data. No inline handlers: a title or URL containing
+      // a quote would otherwise break out of the attribute and execute.
+      const url = String(r.url || '');
+      const title = String(r.title || '');
+      html += `<div class="result-card" data-url="${escAttr(url)}">
+        <div class="rc-title">${escHtml(title)}</div>
+        <div class="rc-url">${escHtml(url)}</div>
         <div class="rc-snip">${escHtml(r.snippet)}</div>
-        <button class="save-btn" onclick="event.stopPropagation();saveLead('${escAttr(r.url)}','${escAttr(r.title)}','${escAttr(loc)}','${escAttr(type)}')">+ Save Lead</button>
+        <button class="save-btn" data-url="${escAttr(url)}" data-title="${escAttr(title)}" data-loc="${escAttr(loc)}" data-type="${escAttr(type)}">+ Save Lead</button>
       </div>`;
     }
     html += '</div>';
@@ -505,12 +502,41 @@ function renderLeads(data, loc, type) {
       <div class="sl-header">PUBLIC DATA SOURCES</div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;">`;
     for (const s of data.public_data_sources) {
-      html += `<a href="${escAttr(s)}" target="_blank" style="font-size:12px;color:var(--accent);font-family:monospace;text-decoration:none;padding:4px 10px;border:1px solid var(--border2);border-radius:6px;">${escHtml(s.replace('https://',''))}</a>`;
+      const href = safeHttpUrl(s);
+      const label = escHtml(String(s).replace('https://',''));
+      html += href
+        ? `<a href="${escAttr(href)}" target="_blank" rel="noopener noreferrer" style="font-size:12px;color:var(--accent);font-family:monospace;text-decoration:none;padding:4px 10px;border:1px solid var(--border2);border-radius:6px;">${label}</a>`
+        : `<span class="srclabel">${label}</span>`;
     }
     html += '</div></div>';
   }
 
   body.innerHTML = html;
+  // Bind events by delegation so untrusted values are read from data-* at
+  // click time rather than interpolated into executable handler strings.
+  body.querySelectorAll('.save-btn').forEach(function (btn) {
+    btn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      saveLead(btn.dataset.url, btn.dataset.title, btn.dataset.loc, btn.dataset.type);
+    });
+  });
+  body.querySelectorAll('.result-card[data-url]').forEach(function (card) {
+    card.addEventListener('click', function () {
+      // Only http(s) is navigable; blocks javascript:/data: URLs.
+      const target = safeHttpUrl(card.dataset.url);
+      if (target) window.open(target, '_blank', 'noopener,noreferrer');
+    });
+  });
+}
+
+// Allow-list navigation to http(s) only. A scraped 'javascript:' URL must
+// never reach window.open.
+function safeHttpUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    if (u.protocol === 'http:' || u.protocol === 'https:') return u.href;
+  } catch (e) { /* not a valid absolute URL */ }
+  return null;
 }
 
 async function saveLead(url, title, location, situation) {
@@ -565,7 +591,11 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
 }
 function escAttr(s) {
-  return String(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');
+  // Full attribute escaping. Inline event handlers were removed, but any
+  // value landing in a double-quoted attribute still needs quotes, angle
+  // brackets and ampersands handled.
+  return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 </script>
 </body>

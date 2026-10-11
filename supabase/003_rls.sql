@@ -69,10 +69,12 @@ CREATE POLICY decisions_user_isolation ON decisions
     WITH CHECK (user_id = auth.uid());
 
 -- Handoffs
-CREATE POLICY handoffs_user_isolation ON handoffs
-    FOR ALL TO authenticated
-    USING (created_at IS NOT NULL)  -- handoffs are readable by all authenticated users
-    WITH CHECK (true);
+-- Handoffs: readable to authenticated users (single-user deployment), but
+-- never client-writable. A client must not be able to forge the handoff that
+-- the next device reconstructs the project from.
+CREATE POLICY handoffs_read ON handoffs
+    FOR SELECT TO authenticated
+    USING (true);
 
 -- Documents
 CREATE POLICY documents_user_isolation ON documents
@@ -87,33 +89,47 @@ CREATE POLICY daily_summaries_user_isolation ON daily_summaries
     WITH CHECK (user_id = auth.uid());
 
 -- Tool permissions
-CREATE POLICY tool_permissions_user_isolation ON tool_permissions
-    FOR ALL TO authenticated
-    USING (user_id = auth.uid())
-    WITH CHECK (user_id = auth.uid());
+-- tool_permissions: read-only to authenticated users. A user_id check alone
+-- would still let that user INSERT or UPDATE their own permission rows, which
+-- is exactly the privilege escalation this table exists to prevent.
+CREATE POLICY tool_permissions_read ON tool_permissions
+    FOR SELECT TO authenticated
+    USING (user_id = auth.uid());
 
--- Tool runs
-CREATE POLICY tool_runs_user_isolation ON tool_runs
-    FOR ALL TO authenticated
-    USING (true)  -- tool runs are readable by all authenticated users
-    WITH CHECK (true);
+-- Tool runs: readable by any authenticated user (single-user deployment),
+-- but NOT writable. Writes are service-role only, so a client token cannot
+-- forge or rewrite an approval record.
+CREATE POLICY tool_runs_read ON tool_runs
+    FOR SELECT TO authenticated
+    USING (true);
 
--- Agent runs
-CREATE POLICY agent_runs_user_isolation ON agent_runs
-    FOR ALL TO authenticated
-    USING (true)  -- agent runs are readable by all authenticated users
-    WITH CHECK (true);
+-- Agent runs: readable, never client-writable. A client must not be able to
+-- mark its own session 'exited' or erase the base/final commit evidence.
+CREATE POLICY agent_runs_read ON agent_runs
+    FOR SELECT TO authenticated
+    USING (true);
 
--- Kill switch
-CREATE POLICY kill_switch_user_isolation ON kill_switch
-    FOR ALL TO authenticated
-    USING (true)  -- kill switch status is visible to all authenticated users
+-- Kill switch: status is visible to all authenticated users so an operator can
+-- see why nothing is working, but only the activating user may write.
+CREATE POLICY kill_switch_read ON kill_switch
+    FOR SELECT TO authenticated
+    USING (true);
+CREATE POLICY kill_switch_write ON kill_switch
+    FOR INSERT TO authenticated
+    WITH CHECK (activated_by = auth.uid());
+CREATE POLICY kill_switch_deactivate ON kill_switch
+    FOR UPDATE TO authenticated
+    USING (activated_by = auth.uid())
     WITH CHECK (activated_by = auth.uid());
 
--- Improvement proposals
-CREATE POLICY improvement_proposals_user_isolation ON improvement_proposals
-    FOR ALL TO authenticated
-    USING (true)  -- proposals are visible to all authenticated users
+-- Improvement proposals: readable to authenticated users, but a client may
+-- only create proposals. Status transitions (applied/rejected) are
+-- service-role only so a proposal cannot be self-approved.
+CREATE POLICY improvement_proposals_read ON improvement_proposals
+    FOR SELECT TO authenticated
+    USING (true);
+CREATE POLICY improvement_proposals_insert ON improvement_proposals
+    FOR INSERT TO authenticated
     WITH CHECK (true);
 
 -- Voice sessions
@@ -145,3 +161,8 @@ CREATE POLICY service_role_full_access ON agent_runs FOR ALL TO service_role USI
 CREATE POLICY service_role_full_access ON kill_switch FOR ALL TO service_role USING (true) WITH CHECK (true);
 CREATE POLICY service_role_full_access ON improvement_proposals FOR ALL TO service_role USING (true) WITH CHECK (true);
 CREATE POLICY service_role_full_access ON voice_sessions FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_role_full_access ON audit_events FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+-- tool_permissions is deliberately absent from the authenticated policies:
+-- it is the permission table, so a client token must never be able to widen its
+-- own ceiling. Only the service role writes it.

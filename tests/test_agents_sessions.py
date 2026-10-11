@@ -233,13 +233,14 @@ def test_preflight_reports_ready_for_clean_repo(app_client, repo, monkeypatch):
 
 
 def test_kill_switch_blocks_preflight(app_client, repo, monkeypatch):
+    """423 Locked, not 403: the resource exists, execution is suspended."""
     monkeypatch.setenv('JAX_PROJECT_ROOTS', str(repo))
     project = app_client.post('/v1/projects', json={
         'name': 'demo', 'status': 'active', 'path_hint': str(repo)}).json()
     app_client.post('/v1/kill/activate', json={'reason': 'test drill'})
     response = app_client.post('/v1/sessions/preflight', json={
         'project_id': project['id'], 'fetch': True})
-    assert response.status_code == 403
+    assert response.status_code == 423
     assert 'Kill switch' in response.json()['detail']
 
 

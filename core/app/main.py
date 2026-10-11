@@ -19,6 +19,7 @@ load_dotenv()
 
 from .privacy import safe_text
 from .self_improve import analyze_project, proposal_to_json, proposal_from_json, LEVEL_DRAFT
+from .self_improve_apply import classify_target, materialize_as_patch, validate_proposal
 from .retrieval import retrieve_context
 from .providers.base import ModelProvider, LocalProvider
 from .providers.openrouter import OpenRouterProvider
@@ -236,6 +237,35 @@ def create_app(database_url=None, admin_token=None):
             raise HTTPException(403, 'Admin required')
         return actor
 
+    def guard_kill(db_conn, device_id=None, global_only=False):
+        """Refuse while a kill switch applies. Raise so callers cannot forget."""
+        if is_kill_active(db_conn, device_id, global_only=global_only):
+            scope = 'globally' if global_only else f'for device {device_id}'
+            raise HTTPException(
+                423, f'Kill switch active {scope}: execution is suspended. '
+                     'Deactivate it to resume.')
+
+    def live(actor=Depends(identity)):
+        """Identity + kill-switch gate, for endpoints that cause side effects.
+
+        The kill switch must stop *execution*, not merely ingestion, or an
+        operator who activates it during an incident gets false assurance.
+        Read-only endpoints deliberately do not use this, so status can still
+        be inspected and the switch can be lifted.
+
+        A device-scoped switch only halts that device. Only a global switch
+        halts admin work, so one compromised machine does not freeze the core.
+        """
+        device_id = actor['id'] if actor['role'] == 'device' else None
+        with engine.connect() as db:
+            guard_kill(db, device_id, global_only=device_id is None)
+        return actor
+
+    def live_admin(actor=Depends(live)):
+        if actor['role'] != 'admin':
+            raise HTTPException(403, 'Admin required')
+        return actor
+
     # -----------------------------------------------------------------------
     # Health
     # -----------------------------------------------------------------------
@@ -262,7 +292,7 @@ def create_app(database_url=None, admin_token=None):
             return [dict(row) for row in db.execute(select(devices.c.id, devices.c.name, devices.c.platform, devices.c.revoked)).mappings()]
 
     @app.post('/v1/devices/{device_id}/revoke')
-    def revoke_device(device_id: UUID, actor=Depends(admin)):
+    def revoke_device(device_id: UUID, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(devices.update().where(devices.c.id == str(device_id)).values(revoked=True))
             if not result.rowcount:
@@ -303,7 +333,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/workspaces', status_code=201)
-    def create_workspace(body: WorkspaceIn, actor=Depends(admin)):
+    def create_workspace(body: WorkspaceIn, actor=Depends(live_admin)):
         wid = str(uuid4())
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
@@ -319,7 +349,7 @@ def create_app(database_url=None, admin_token=None):
         return [dict(r) for r in rows]
 
     @app.delete('/v1/workspaces/{workspace_id}')
-    def delete_workspace(workspace_id: UUID, actor=Depends(admin)):
+    def delete_workspace(workspace_id: UUID, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(workspaces.delete().where(workspaces.c.id == str(workspace_id)))
             if not result.rowcount:
@@ -331,7 +361,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/projects', status_code=201)
-    def create_project(body: dict, actor=Depends(admin)):
+    def create_project(body: dict, actor=Depends(live_admin)):
         pid = str(uuid4())
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
@@ -359,7 +389,7 @@ def create_app(database_url=None, admin_token=None):
         return dict(row)
 
     @app.put('/v1/projects/{project_id}')
-    def update_project(project_id: UUID, body: dict, actor=Depends(admin)):
+    def update_project(project_id: UUID, body: dict, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(
                 projects.update().where(projects.c.id == str(project_id)).values(**body))
@@ -368,7 +398,7 @@ def create_app(database_url=None, admin_token=None):
         return {'id': str(project_id), 'updated': True}
 
     @app.delete('/v1/projects/{project_id}')
-    def delete_project(project_id: UUID, actor=Depends(admin)):
+    def delete_project(project_id: UUID, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(projects.delete().where(projects.c.id == str(project_id)))
             if not result.rowcount:
@@ -384,7 +414,7 @@ def create_app(database_url=None, admin_token=None):
         fast_forward: bool = False
 
     @app.post('/v1/sessions/preflight')
-    def session_preflight(body: PreflightIn, actor=Depends(admin)):
+    def session_preflight(body: PreflightIn, actor=Depends(live_admin)):
         with engine.connect() as db:
             if is_kill_active(db, None):
                 raise HTTPException(403, 'Kill switch active')
@@ -418,7 +448,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/memories', status_code=201)
-    def save_memory(body: MemoryIn, actor=Depends(admin)):
+    def save_memory(body: MemoryIn, actor=Depends(live_admin)):
         mid = str(uuid4())
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
@@ -440,7 +470,7 @@ def create_app(database_url=None, admin_token=None):
         return [dict(r) for r in rows]
 
     @app.delete('/v1/memories/{memory_id}')
-    def delete_memory(memory_id: UUID, actor=Depends(admin)):
+    def delete_memory(memory_id: UUID, actor=Depends(live_admin)):
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
             row = db.execute(select(memories).where(memories.c.id == str(memory_id))).mappings().first()
@@ -459,7 +489,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/tasks', status_code=201)
-    def create_task(body: TaskIn, actor=Depends(admin)):
+    def create_task(body: TaskIn, actor=Depends(live_admin)):
         tid = str(uuid4())
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
@@ -479,7 +509,7 @@ def create_app(database_url=None, admin_token=None):
         return [dict(r) for r in rows]
 
     @app.put('/v1/tasks/{task_id}')
-    def update_task(task_id: UUID, body: dict, actor=Depends(admin)):
+    def update_task(task_id: UUID, body: dict, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(tasks.update().where(tasks.c.id == str(task_id)).values(**body))
             if not result.rowcount:
@@ -487,7 +517,7 @@ def create_app(database_url=None, admin_token=None):
         return {'id': str(task_id), 'updated': True}
 
     @app.delete('/v1/tasks/{task_id}')
-    def delete_task(task_id: UUID, actor=Depends(admin)):
+    def delete_task(task_id: UUID, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(tasks.delete().where(tasks.c.id == str(task_id)))
             if not result.rowcount:
@@ -499,7 +529,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/decisions', status_code=201)
-    def create_decision(body: DecisionIn, actor=Depends(admin)):
+    def create_decision(body: DecisionIn, actor=Depends(live_admin)):
         did = str(uuid4())
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
@@ -520,7 +550,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/handoffs', status_code=201)
-    def create_handoff(body: HandoffIn, actor=Depends(admin)):
+    def create_handoff(body: HandoffIn, actor=Depends(live_admin)):
         hid = str(uuid4())
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
@@ -540,7 +570,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/retrieve')
-    def retrieve(body: ChatRequest, actor=Depends(admin)):
+    def retrieve(body: ChatRequest, actor=Depends(live_admin)):
         with engine.connect() as db:
             ctx = retrieve_context(
                 body.query,
@@ -555,7 +585,7 @@ def create_app(database_url=None, admin_token=None):
     # -----------------------------------------------------------------------
 
     @app.post('/v1/chat')
-    async def chat(body: ChatRequest, actor=Depends(admin)):
+    async def chat(body: ChatRequest, actor=Depends(live_admin)):
         with engine.connect() as db:
             ctx = retrieve_context(
                 body.query,
@@ -591,7 +621,7 @@ def create_app(database_url=None, admin_token=None):
         return {'approvals': app.state.approvals.list(state)}
 
     @app.post('/v1/approvals', status_code=201)
-    def request_approval(body: ApprovalRequestIn, actor=Depends(admin)):
+    def request_approval(body: ApprovalRequestIn, actor=Depends(live_admin)):
         """Request approval for one L4 action. Grants nothing by itself."""
         try:
             result = app.state.approvals.request(
@@ -656,7 +686,7 @@ def create_app(database_url=None, admin_token=None):
         machine_id: str = Field(min_length=1, max_length=120)
 
     @app.post('/v1/sessions/{session_id}/launch-agent')
-    def launch_agent(session_id: str, body: LaunchAgentRequest, actor=Depends(admin)):
+    def launch_agent(session_id: str, body: LaunchAgentRequest, actor=Depends(live_admin)):
         """Launch an adapter after the policy and kill-switch checks."""
         try:
             return app.state.sessions.launch(
@@ -672,7 +702,7 @@ def create_app(database_url=None, admin_token=None):
 
     @app.post('/v1/sessions/{session_id}/verify')
     def verify_session(session_id: str, body: VerifySessionRequest,
-                       actor=Depends(admin)):
+                       actor=Depends(live_admin)):
         """Run configured verification, then write a truthful handoff."""
         try:
             return app.state.sessions.verify_and_close(
@@ -682,9 +712,14 @@ def create_app(database_url=None, admin_token=None):
 
     @app.post('/v1/sessions/{session_id}/handoff')
     def close_session(session_id: str, body: VerifySessionRequest,
-                      actor=Depends(admin)):
-        """Close the session. Same evidence contract as verify."""
-        return verify_session(session_id, body)
+                      actor=Depends(live_admin)):
+        """Close the session. Same evidence contract as verify.
+
+        Gated: a close writes a handoff and can run verification commands, so
+        it is an action rather than a read.
+        """
+        return app.state.sessions.verify_and_close(
+            session_id, body.root, body.test_commands, fetch=body.fetch)
 
     # -----------------------------------------------------------------------
     # Voice endpoints
@@ -708,7 +743,7 @@ def create_app(database_url=None, admin_token=None):
         project_id: str | None = None
 
     @app.post('/v1/voice/speak')
-    async def speak(body: SpeakRequest, actor=Depends(admin)):
+    async def speak(body: SpeakRequest, actor=Depends(live_admin)):
         """Convert text to speech. Returns audio/mpeg bytes."""
         try:
             audio = await app.state.voice.text_to_speech(body.text, body.voice)
@@ -718,7 +753,7 @@ def create_app(database_url=None, admin_token=None):
         return Response(content=audio, media_type='audio/mpeg')
 
     @app.post('/v1/voice/listen')
-    async def listen(body: ListenRequest, actor=Depends(admin)):
+    async def listen(body: ListenRequest, actor=Depends(live_admin)):
         """Convert speech to text. Returns transcript."""
         import base64
         audio_bytes = base64.b64decode(body.audio_base64)
@@ -729,7 +764,7 @@ def create_app(database_url=None, admin_token=None):
         return {'transcript': transcript}
 
     @app.post('/v1/voice/chat')
-    async def voice_chat(body: VoiceChatRequest, actor=Depends(admin)):
+    async def voice_chat(body: VoiceChatRequest, actor=Depends(live_admin)):
         """Full voice chat: speech → text → LLM → speech."""
         import base64
         audio_bytes = base64.b64decode(body.audio_base64)
@@ -811,7 +846,7 @@ def create_app(database_url=None, admin_token=None):
         project_root: Optional[str] = None
 
     @app.post('/v1/self-improve/analyze')
-    def run_analysis(body: AnalyzeRequest | None = None, actor=Depends(admin)):
+    def run_analysis(body: AnalyzeRequest | None = None, actor=Depends(live_admin)):
         root = body.project_root if body and body.project_root else str(Path(__file__).resolve().parents[2])
         proposals = analyze_project(root)
         now = datetime.now(timezone.utc)
@@ -845,28 +880,65 @@ def create_app(database_url=None, admin_token=None):
         model_config = ConfigDict(extra='forbid')
         confirm: bool
 
-    @app.post('/v1/self-improve/proposals/{proposal_id}/apply')
-    def apply_proposal(proposal_id: UUID, body: ApplyRequest, actor=Depends(admin)):
+    @app.post('/v1/self-improve/proposals/{proposal_id}/apply', status_code=202)
+    def apply_proposal(proposal_id: UUID, body: ApplyRequest, actor=Depends(live_admin)):
+        """Materialize a proposal as a reviewable patch.
+
+        This does NOT change any file. JAX may propose and test, but it must not
+        silently rewrite its own code, so the response reports applied=false
+        and requires_review=true. Use the returned patch_ref to review and merge.
+        """
         if not body.confirm:
             raise HTTPException(400, 'Explicit confirm=True is required to apply a proposal')
+        with engine.connect() as db:
+            row = db.execute(
+                select(improvement_proposals)
+                .where(improvement_proposals.c.id == str(proposal_id))
+            ).mappings().first()
+        if row is None:
+            raise HTTPException(404, 'Proposal not found')
+        if row['status'] != 'pending':
+            raise HTTPException(409, f"Proposal is {row['status']}, not pending")
+
+        proposal = proposal_from_json(row['proposal_json'])
+        project_root = Path(os.environ.get('JAX_PROJECT_ROOTS', '.')).parts[0:1]
+        root = Path(project_root[0]) if project_root else Path('.')
+        # Prefer a configured root that actually contains the target.
+        for candidate in os.environ.get('JAX_PROJECT_ROOTS', '').split(os.pathsep):
+            if not candidate.strip():
+                continue
+            base = Path(candidate.strip())
+            if base.exists() and proposal.get('file_path', '').startswith(str(base)):
+                root = base
+                break
+        else:
+            root = Path(row['file_path']).parent if row['file_path'] else Path('.')
+
+        outcome = materialize_as_patch(proposal, root)
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
-            result = db.execute(
+            db.execute(
                 improvement_proposals.update()
                 .where(improvement_proposals.c.id == str(proposal_id))
                 .where(improvement_proposals.c.status == 'pending')
-                .values(status='applied', applied_at=now)
+                .values(status='applied', applied_at=now,
+                        reviewer_note=outcome.reason[:500])
             )
-            if not result.rowcount:
-                raise HTTPException(404, 'Proposal not found or not in pending state')
-        return {'id': str(proposal_id), 'status': 'applied', 'applied_at': now.isoformat()}
+        app.state.audit.record(actor['id'], 'self_improve.apply',
+                               row['file_path'] or str(proposal_id),
+                               outcome.status,
+                               {'patch_ref': outcome.patch_ref,
+                                'applied': outcome.applied})
+        return {'id': str(proposal_id), **outcome.to_dict(),
+                'applied_at': now.isoformat(),
+                'note': 'No file was modified. Review the patch and merge it yourself.'}
 
     class RejectRequest(BaseModel):
         model_config = ConfigDict(extra='forbid')
         note: str = ''
 
     @app.post('/v1/self-improve/proposals/{proposal_id}/reject')
-    def reject_proposal(proposal_id: UUID, body: RejectRequest, actor=Depends(admin)):
+    def reject_proposal(proposal_id: UUID, body: RejectRequest, actor=Depends(live_admin)):
         now = datetime.now(timezone.utc)
         with engine.begin() as db:
             result = db.execute(
@@ -899,7 +971,7 @@ def create_app(database_url=None, admin_token=None):
         contact_info: Optional[str] = None
 
     @app.post('/v1/leads/search')
-    async def search_leads(body: LeadSearchRequest, actor=Depends(admin)):
+    async def search_leads(body: LeadSearchRequest, actor=Depends(live_admin)):
         """Search public web data for distressed property sellers."""
         search_data = await lead_finder.search(
             location=body.location,
@@ -928,7 +1000,7 @@ def create_app(database_url=None, admin_token=None):
         }
 
     @app.post('/v1/leads', status_code=201)
-    def save_lead(body: dict, actor=Depends(admin)):
+    def save_lead(body: dict, actor=Depends(live_admin)):
         """Manually save a lead to the database."""
         lid = str(uuid4())
         now = datetime.now(timezone.utc)
@@ -964,7 +1036,7 @@ def create_app(database_url=None, admin_token=None):
         return [dict(r) for r in rows]
 
     @app.put('/v1/leads/{lead_id}')
-    def update_lead(lead_id: UUID, body: LeadUpdateRequest, actor=Depends(admin)):
+    def update_lead(lead_id: UUID, body: LeadUpdateRequest, actor=Depends(live_admin)):
         """Update lead status or notes."""
         now = datetime.now(timezone.utc)
         updates: dict = {'updated_at': now}
@@ -985,7 +1057,7 @@ def create_app(database_url=None, admin_token=None):
         return {'id': str(lead_id), 'updated': True}
 
     @app.delete('/v1/leads/{lead_id}')
-    def delete_lead(lead_id: UUID, actor=Depends(admin)):
+    def delete_lead(lead_id: UUID, actor=Depends(live_admin)):
         with engine.begin() as db:
             result = db.execute(leads_table.delete().where(leads_table.c.id == str(lead_id)))
             if not result.rowcount:
