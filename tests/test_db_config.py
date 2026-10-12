@@ -45,6 +45,26 @@ def test_create_app_uses_supabase_url(monkeypatch, tmp_path):
     app.state.engine.dispose()
 
 
+@pytest.mark.parametrize('scheme', ['postgres://', 'postgresql://'])
+def test_postgres_urls_use_psycopg_without_prepared_statements(monkeypatch, scheme):
+    import core.app.db as db
+    seen = {}
+
+    def fake_create_engine(url, **options):
+        seen['url'], seen['options'] = url, options
+
+        class Engine:
+            dialect = type('D', (), {'name': 'postgresql'})
+        return Engine()
+
+    monkeypatch.setattr(db, 'create_engine', fake_create_engine)
+    monkeypatch.setattr(db.metadata, 'create_all', lambda engine: None)
+    db.make_engine(scheme + 'u:p@host:5432/db')
+    assert seen['url'] == 'postgresql+psycopg://u:p@host:5432/db'
+    assert seen['options']['connect_args'] == {'prepare_threshold': None}
+    assert seen['options']['pool_pre_ping'] is True
+
+
 def test_no_database_on_read_only_fs_says_what_to_set(monkeypatch):
     def deny(self, *args, **kwargs):
         raise OSError(30, 'Read-only file system')

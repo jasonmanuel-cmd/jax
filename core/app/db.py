@@ -54,9 +54,18 @@ def make_engine(url):
                 f'SUPABASE_DATABASE_URL). The local SQLite fallback at {path} '
                 f'is not writable here ({exc}).') from exc
         url = 'sqlite:///' + (path / 'jax.db').as_posix()
-    if url.startswith('postgresql://'):
-        url = url.replace('postgresql://', 'postgresql+psycopg://', 1)
+    # Hosts hand out both spellings; SQLAlchemy only knows "postgresql".
+    for scheme in ('postgres://', 'postgresql://'):
+        if url.startswith(scheme):
+            url = 'postgresql+psycopg://' + url[len(scheme):]
+            break
     options = {}
+    if url.startswith('postgresql+psycopg:'):
+        # Supabase's pooler (pgbouncer, transaction mode) cannot keep psycopg's
+        # server-side prepared statements, which it creates after a few
+        # repeats of a query. Disable them; also drop stale pooled connections.
+        options['connect_args'] = {'prepare_threshold': None}
+        options['pool_pre_ping'] = True
     if url.startswith('sqlite:'):
         options['connect_args'] = {'check_same_thread': False}
         if url in ('sqlite://', 'sqlite:///:memory:'):
