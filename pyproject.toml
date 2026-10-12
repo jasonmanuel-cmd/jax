@@ -1,2 +1,17 @@
+[project]
+name = "jax"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy",
+    "httpx",
+    "pytest",
+    "pydantic-settings",
+    "psycopg[binary]",
+    "python-dotenv",
+]
+
 [tool.vercel]
 entrypoint = "core.app.asgi:app"
