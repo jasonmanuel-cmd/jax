@@ -1,4 +1,5 @@
 """SQLAlchemy storage. Tokens are digests; SQLite enforces foreign keys."""
+import os
 from pathlib import Path
 from sqlalchemy import Table, Column, String, Boolean, JSON, ForeignKey, create_engine, event, DateTime, Text
 from sqlalchemy.pool import StaticPool
@@ -28,6 +29,14 @@ improvement_proposals = Table('improvement_proposals', metadata,
     Column('reviewer_note', Text, nullable=True))
 
 
+def database_url_from_env():
+    """JAX_DATABASE_URL wins; SUPABASE_DATABASE_URL is the name .env.example
+    documents, so honour it too rather than silently ignoring it."""
+    return (os.environ.get('JAX_DATABASE_URL')
+            or os.environ.get('SUPABASE_DATABASE_URL')
+            or None)
+
+
 def make_engine(url):
     # Import phase-2 tables here so they register on the same metadata
     # BEFORE create_all is called, but AFTER metadata is defined.
@@ -35,7 +44,15 @@ def make_engine(url):
 
     if url is None:
         path = Path(__file__).resolve().parents[2] / 'data'
-        path.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # Read-only deployments (e.g. Vercel) cannot use the local SQLite
+            # fallback. Say what to set instead of crashing on mkdir.
+            raise RuntimeError(
+                'No database configured: set JAX_DATABASE_URL (or '
+                f'SUPABASE_DATABASE_URL). The local SQLite fallback at {path} '
+                f'is not writable here ({exc}).') from exc
         url = 'sqlite:///' + (path / 'jax.db').as_posix()
     if url.startswith('postgresql://'):
         url = url.replace('postgresql://', 'postgresql+psycopg://', 1)
