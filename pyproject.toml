@@ -1,2 +1,2 @@
 [tool.vercel]
-entrypoint = "core/app/asgi.py"
+entrypoint = "core.app.asgi:app"
