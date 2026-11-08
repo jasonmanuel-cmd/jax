@@ -33,7 +33,7 @@ from .audit.approvals import ApprovalStore, AuditLog
 from .policy_engine import PolicyDenied, default_registry
 from .core.session_manager import LaunchRefused, SessionManager
 from sqlalchemy import select
-from .db import devices, events, improvement_proposals, make_engine
+from .db import database_url_from_env, devices, events, improvement_proposals, make_engine
 from .tables2 import (
     workspaces, projects, memories, memory_deletion_audit,
     tasks, decisions, handoffs, documents, daily_summaries,
@@ -166,7 +166,7 @@ def create_app(database_url=None, admin_token=None):
     token = admin_token if admin_token is not None else os.environ.get('JAX_ADMIN_TOKEN', '')
     if len(token) < 32:
         raise ValueError('JAX_ADMIN_TOKEN must contain at least 32 characters')
-    engine = make_engine(database_url or os.environ.get('JAX_DATABASE_URL'))
+    engine = make_engine(database_url or database_url_from_env())
 
     # Wire real model provider based on env vars
     provider_name = os.environ.get('JAX_PROVIDER', 'openrouter').lower()

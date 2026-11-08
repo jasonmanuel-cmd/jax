@@ -2,8 +2,54 @@
 
 **Canonical spec:** `docs/JAX_Master_Developer_Specification.pdf` (Sept 27, 2026) — archived and adopted as design authority. See `DECISIONS.md`.
 
-**Suite:** `python -m pytest tests/ -q` → **311 passed, 6 deselected** (92s).
+**Suite:** `python -m pytest tests/ -q` → **323 passed, 6 deselected** (~28s, Python 3.13 venv, SQLite; earlier 311 figure was 92s on the laptop).
 Deselected are `slow`-marked live-inference tests; run them with `-m slow`.
+
+## Hosted deployment (Vercel) pass — 2026-10-12
+
+Goal: get the FastAPI app serving its UI on Vercel. Status: **builds succeed; runtime on Vercel is unverified** (see "Remaining problems").
+
+### Changes and files affected
+
+| Change | Files | Where |
+|---|---|---|
+| Vercel entrypoint: `[tool.vercel] entrypoint = "core.app.asgi:app"` | `pyproject.toml` | merged, PR #1 |
+| Module-level `app` for hosts (`create_app()` is a factory) | `core/app/asgi.py` (new) | merged, PR #1 |
+| Project-scoped MCP registration of the iFixAi connector | `.mcp.json` (new) | merged, PR #1 |
+| `[project]` metadata (name, version, requires-python, dependencies) required by `uv` | `pyproject.toml` | merged, PR #3 (Vercel agent, not this session) |
+| DB URL lookup: `JAX_DATABASE_URL`, then `SUPABASE_DATABASE_URL` (empty = unset) | `core/app/db.py` (`database_url_from_env`), `core/app/main.py`, `.env.example` | PR #4 (open, draft) |
+| No-database on a read-only filesystem raises `RuntimeError` naming the variables, instead of a bare `mkdir` crash | `core/app/db.py` | PR #4 |
+| `postgres://` accepted as well as `postgresql://`; psycopg `prepare_threshold=None` (pgbouncer transaction-mode pooler cannot keep server-side prepared statements); `pool_pre_ping=True` | `core/app/db.py` | PR #4 |
+| Failed `create_app()` is logged and served as a fail-closed **503 JSON** naming the problem; only this codebase's own `ValueError`/`RuntimeError` text is shown, SQLAlchemy errors reduced to a generic database message, anything else to its type name | `core/app/asgi.py` | PR #4 |
+| 12 new tests | `tests/test_db_config.py`, `tests/test_asgi_entrypoint.py` | PR #4 |
+
+`start_server.py` and the local/dev path call `create_app()` directly and are unchanged.
+
+### Checks performed and actual results
+
+- Full suite after PR #4 changes: **323 passed, 6 deselected**. Python 3.13 in a scratch venv from `requirements.txt`; the project's stated target is 3.12 and `requires-python` is `>=3.11`, so 3.12 itself was not run.
+- `import core.app.asgi` with a valid token + SQLite URL + `JAX_PROVIDER=stub` yields a `FastAPI` app titled "JAX Core". Passed.
+- Startup-failure messages reproduced locally: missing token → `ValueError: JAX_ADMIN_TOKEN must contain at least 32 characters`; simulated read-only filesystem → the new `RuntimeError`; bad provider → `RuntimeError: Unknown JAX_PROVIDER`. Unreachable Postgres: only SQLAlchemy's background-link line (`e3q8`, its OperationalError code) was seen, **not** the full first line.
+- `uv lock` on a `pyproject.toml` containing only `[tool.vercel]` **succeeded locally**, so the local check did **not** predict the Vercel build failure.
+- Vercel preview builds, from the PR status comments (build state only, runtime never opened by this session):
+  - `31809b7` (entrypoint as file path `core/app/asgi.py`): **Error** (~3s).
+  - `f876793` (entrypoint as `core.app.asgi:app`): **Error** (~5s).
+  - `master` after PR #3: user reported "it did build" and then saw `500 FUNCTION_INVOCATION_FAILED` on the site.
+  - `b9eb050` and `ac2356c` (PR #4): **Ready**.
+- The user reported a `500 FUNCTION_INVOCATION_FAILED` screenshot (URL not stated). It was **not re-checked** after `ac2356c`, the first commit that can report the cause in the browser.
+
+### Remaining problems
+
+1. **Unknown cause of the runtime 500.** Not diagnosed. The Vercel connector in this session gets 403/404 on this team's deployments, so build and runtime logs were never read. Candidates, from reading the code: missing `JAX_ADMIN_TOKEN` (`main.py` raises at import); database URL under the wrong variable name or an IPv6-only Supabase direct host from IPv4 Vercel; env vars set for one Vercel environment (Production/Preview/Development) but not the one being hit.
+2. **Vercel env vars are unset or unconfirmed** and cannot be set from code: `JAX_ADMIN_TOKEN` (32+ chars), a hosted `JAX_PROVIDER` (`ollama` cannot reach a laptop from Vercel) with its API key, and the Supabase **pooler** URL.
+3. **`prepare_threshold=None` and the pooler fix are untested against a real pgbouncer or Postgres.** They rest on psycopg/Supabase documentation and a unit test of the engine arguments only.
+4. **`pyproject.toml` dependencies duplicate `requirements.txt`** (added by PR #3) and include `pytest` as a runtime dependency. Two lists to keep in sync; not cleaned up.
+5. **iFixAi connector is not live.** `https://mcp.ifixai.ai/mcp` returns proxy `403 CONNECT tunnel failed` from the session container (curl and the MCP client both), even after the user said the domain was allowed and the session restarted. The `ifixai-operator-guide` prompt was never fetched and the demo audit was never run. Likely cause: the allowlist edit is not reaching this container (different environment, unsaved, or an old container).
+6. **Previously recorded gaps are untouched:** Postgres never exercised, RLS shape-only, R3/R4/R9/R10 partial, cross-device continuity unproven.
+
+### Next concrete action
+
+Open the PR #4 preview URL. If the UI loads, merge PR #4 and set the env vars for Production. If it shows the JSON "JAX failed to start", set the variable named in `detail`, tick every environment, and redeploy. If it still shows the old Vercel 500 page, read the deployment's runtime Logs and use the last traceback line.
 
 ## Verified this pass
 
@@ -51,4 +97,5 @@ No discrete GPU (Intel UHD 730 integrated graphics), 31.7 GB RAM. `qwen3-coder:3
 
 ## Next action
 
-Stand up a real Postgres instance and run the RLS role/isolation tests against it — R2 is asserted as SQL text and has never been executed. After that, cross-device continuity needs a second physical machine, which no further work on this laptop can prove.
+1. **Hosted deployment first:** see "Next concrete action" under the Vercel pass above.
+2. Then: stand up a real Postgres instance and run the RLS role/isolation tests against it — R2 is asserted as SQL text and has never been executed. After that, cross-device continuity needs a second physical machine, which no further work on this laptop can prove.
